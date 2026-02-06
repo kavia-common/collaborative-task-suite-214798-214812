@@ -73,27 +73,92 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 
 # Database
-# Use Postgres in real environments; fallback to sqlite for dev if not configured.
+# Prefer PostgreSQL (database container), but allow local SQLite for quick dev.
 #
-# Required env vars for the database container (provided by orchestrator):
-# POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT
-POSTGRES_URL = os.getenv("POSTGRES_URL")
-POSTGRES_USER = os.getenv("POSTGRES_USER")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
-POSTGRES_DB = os.getenv("POSTGRES_DB")
-POSTGRES_PORT = os.getenv("POSTGRES_PORT")
+# Orchestrator-provided env vars for the database container:
+#   POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT
+#
+# Also supported (common convention):
+#   DATABASE_URL=postgresql://user:pass@host:port/dbname
+#
+# IMPORTANT: Do not silently fall back to sqlite if partial Postgres configuration
+# is present; that would mask deployment misconfiguration.
+POSTGRES_URL = os.getenv("POSTGRES_URL", "").strip()
+POSTGRES_USER = os.getenv("POSTGRES_USER", "").strip()
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "").strip()
+POSTGRES_DB = os.getenv("POSTGRES_DB", "").strip()
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-if POSTGRES_URL and POSTGRES_USER and POSTGRES_PASSWORD and POSTGRES_DB and POSTGRES_PORT:
+
+def _normalize_db_host(host: str) -> str:
+    """Return a host value safe for Django's DB HOST field.
+
+    Some platforms provide POSTGRES_URL including a scheme (e.g. 'postgres://db:5432');
+    Django expects a bare hostname/IP in HOST.
+    """
+    if not host:
+        return host
+    # Strip common schemes if present.
+    for prefix in ("postgres://", "postgresql://"):
+        if host.startswith(prefix):
+            return host[len(prefix) :]
+    return host
+
+
+def _env_present(*values: str) -> bool:
+    """True if all provided values are non-empty."""
+    return all(v is not None and str(v).strip() != "" for v in values)
+
+
+if DATABASE_URL:
+    # Django 5+ supports DATABASE_URL via dj-database-url, but we intentionally avoid
+    # extra dependencies here. Keep it simple by parsing minimally.
+    #
+    # Expected format: postgresql://user:pass@host:port/dbname
+    try:
+        from urllib.parse import urlparse
+    except Exception:  # pragma: no cover
+        urlparse = None  # type: ignore
+
+    if not urlparse:
+        raise RuntimeError("DATABASE_URL is set but urllib.parse.urlparse is unavailable.")
+
+    parsed = urlparse(DATABASE_URL)
+    if parsed.scheme not in {"postgres", "postgresql"}:
+        raise RuntimeError(f"Unsupported DATABASE_URL scheme: {parsed.scheme}")
+
+    db_name = (parsed.path or "").lstrip("/")
+    if not db_name:
+        raise RuntimeError("DATABASE_URL is missing a database name path component.")
+
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": db_name,
+            "USER": parsed.username or "",
+            "PASSWORD": parsed.password or "",
+            "HOST": parsed.hostname or "",
+            "PORT": str(parsed.port or ""),
+        }
+    }
+elif _env_present(POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT):
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
             "NAME": POSTGRES_DB,
             "USER": POSTGRES_USER,
             "PASSWORD": POSTGRES_PASSWORD,
-            "HOST": POSTGRES_URL,
+            "HOST": _normalize_db_host(POSTGRES_URL),
             "PORT": POSTGRES_PORT,
         }
     }
+elif any([POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT]):
+    raise RuntimeError(
+        "Partial PostgreSQL configuration detected. "
+        "Set all of POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT "
+        "or provide DATABASE_URL."
+    )
 else:
     DATABASES = {
         "default": {
